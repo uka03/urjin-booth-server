@@ -1,0 +1,23 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+env/
+
+# Local caches
+.numba_cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated app files
+photos/
+
+# Environment files
+.env
+.env.*
