@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -27,14 +28,65 @@ os.environ.setdefault("NUMBA_CACHE_DIR", str(NUMBA_CACHE_DIR))
 PRINT_DPI = 300
 PRINT_PHOTO_WIDTH_CM = 3
 PRINT_PHOTO_HEIGHT_CM = 4
-PRINT_SHEET_WIDTH_CM = 10
-PRINT_SHEET_HEIGHT_CM = 15
+# Printer/driver scaling calibration. Your printer currently enlarges a 3x4 cm
+# generated photo to about 3.5x4.5 cm, so render smaller to get 3x4 cm on paper.
+PRINT_RENDER_PHOTO_WIDTH_CM = float(os.environ.get("URJIN_RENDER_PHOTO_WIDTH_CM", "2.57"))
+PRINT_RENDER_PHOTO_HEIGHT_CM = float(os.environ.get("URJIN_RENDER_PHOTO_HEIGHT_CM", "3.56"))
+PRINT_SHEET_WIDTH_CM = 7
+PRINT_SHEET_HEIGHT_CM = 10
 PRINT_GAP_CM = 0
 PRINT_CUT_LINE_WIDTH_PX = 1
 HEAD_TARGET_HEIGHT_RATIO = 0.8
+PRINT_PRINTER_NAME = os.environ.get("URJIN_PRINTER_NAME")
+PRINT_MEDIA = os.environ.get("URJIN_PRINT_MEDIA", "Custom.70x100mm")
+PRINT_INPUT_SLOT = os.environ.get("URJIN_PRINT_INPUT_SLOT", "Rear")
+PRINT_MEDIA_TYPE = os.environ.get("URJIN_PRINT_MEDIA_TYPE", "PremiumGlossy")
+PRINT_QUALITY = os.environ.get("URJIN_PRINT_QUALITY", "5")
+
+
+def lp_print_args(filepath: Path) -> list[str]:
+    args = ["lp"]
+    if PRINT_PRINTER_NAME:
+        args.extend(["-d", PRINT_PRINTER_NAME])
+
+    # These CUPS option names are common for inkjet photo printers, but printer
+    # drivers can expose different values. Override them with URJIN_PRINT_* envs.
+    args.extend(
+        [
+            "-o",
+            f"media={PRINT_MEDIA}",
+            "-o",
+            f"InputSlot={PRINT_INPUT_SLOT}",
+            "-o",
+            f"MediaType={PRINT_MEDIA_TYPE}",
+            "-o",
+            f"print-quality={PRINT_QUALITY}",
+            "-o",
+            "fit-to-page",
+            str(filepath),
+        ]
+    )
+    return args
+
+
+def release_macos_camera_service() -> None:
+    if sys.platform != "darwin":
+        return
+
+    # macOS often starts PTPCamera when a USB camera is attached. It claims the
+    # PTP interface and prevents gphoto2 from capturing, so stop it before use.
+    subprocess.run(
+        ["killall", "PTPCamera"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
 
 
 def run_gphoto2(args: list[str]) -> subprocess.CompletedProcess[str]:
+    release_macos_camera_service()
+
     try:
         return subprocess.run(
             ["gphoto2", *args],
@@ -54,12 +106,58 @@ def run_gphoto2(args: list[str]) -> subprocess.CompletedProcess[str]:
         ) from exc
 
 
+def command_detail(result: subprocess.CompletedProcess[str]) -> str:
+    return result.stderr.strip() or result.stdout.strip() or "Camera command failed"
+
+
+def capture_photo(filepath: Path) -> subprocess.CompletedProcess[str]:
+    result = run_gphoto2(["--capture-image-and-download", f"--filename={filepath}"])
+    if result.returncode == 0 and filepath.exists():
+        return result
+
+    fallback_errors = [command_detail(result)]
+    unsupported_capture = (
+        "Unsupported operation" in result.stderr
+        or "does not support generic capture" in result.stderr
+    )
+    if not unsupported_capture:
+        return result
+
+    trigger_result = run_gphoto2(["--trigger-capture"])
+    if trigger_result.returncode != 0:
+        fallback_errors.append(command_detail(trigger_result))
+        return subprocess.CompletedProcess(
+            args=trigger_result.args,
+            returncode=trigger_result.returncode,
+            stdout=trigger_result.stdout,
+            stderr="\n".join(fallback_errors),
+        )
+
+    download_result = run_gphoto2(
+        ["--wait-event-and-download=15s", f"--filename={filepath}"]
+    )
+    if download_result.returncode == 0 and filepath.exists():
+        return download_result
+
+    fallback_errors.append(command_detail(download_result))
+    return subprocess.CompletedProcess(
+        args=download_result.args,
+        returncode=download_result.returncode,
+        stdout=download_result.stdout,
+        stderr="\n".join(fallback_errors),
+    )
+
+
 def normalized_photo_id(photo_id: str) -> str:
     photo_name = Path(photo_id).name
-    if photo_name.endswith(".jpg"):
-        photo_name = photo_name[:-4]
     if photo_name.endswith("-bg-removed.png"):
         photo_name = photo_name[:-15]
+    elif photo_name.endswith("-print.jpg"):
+        photo_name = photo_name[:-10]
+    elif photo_name.endswith("-print.pdf"):
+        photo_name = photo_name[:-10]
+    elif photo_name.endswith(".jpg"):
+        photo_name = photo_name[:-4]
 
     try:
         uuid.UUID(photo_name)
@@ -91,6 +189,37 @@ def print_pdf_response(photo_id: str) -> FileResponse:
     if not filepath.exists():
         raise HTTPException(status_code=404, detail="Print file not found")
     return FileResponse(filepath, media_type="application/pdf")
+
+
+def send_print_job(photo_id: str) -> dict[str, str]:
+    photo_name = normalized_photo_id(photo_id)
+    filepath = PHOTO_DIR / f"{photo_name}-print.pdf"
+    if not filepath.exists():
+        raise HTTPException(status_code=404, detail="Print file not found")
+
+    try:
+        result = subprocess.run(
+            lp_print_args(filepath),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Printer command is not available. Install or enable CUPS/lp.",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="Printer command timed out") from exc
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "Print failed"
+        raise HTTPException(status_code=500, detail=detail)
+
+    return {
+        "id": photo_name,
+        "message": result.stdout.strip() or "Print job submitted",
+    }
 
 
 def print_preview_response(photo_id: str) -> FileResponse:
@@ -212,8 +341,8 @@ def create_print_files(photo_id: str) -> tuple[Path, Path, bool, bool]:
             detail="Print generation needs Pillow. Install it with: python3 -m pip install pillow",
         ) from exc
 
-    photo_width = cm_to_px(PRINT_PHOTO_WIDTH_CM)
-    photo_height = cm_to_px(PRINT_PHOTO_HEIGHT_CM)
+    photo_width = cm_to_px(PRINT_RENDER_PHOTO_WIDTH_CM)
+    photo_height = cm_to_px(PRINT_RENDER_PHOTO_HEIGHT_CM)
     sheet_width = cm_to_px(PRINT_SHEET_WIDTH_CM)
     sheet_height = cm_to_px(PRINT_SHEET_HEIGHT_CM)
     gap = cm_to_px(PRINT_GAP_CM)
@@ -230,7 +359,7 @@ def create_print_files(photo_id: str) -> tuple[Path, Path, bool, bool]:
     block_width = photo_width * 2 + gap
     block_height = photo_height * 2 + gap
     start_x = (sheet_width - block_width) // 2
-    start_y = 30
+    start_y = 120
 
     for row in range(2):
         for col in range(2):
@@ -285,14 +414,14 @@ def capture():
     filename = f"{photo_id}.jpg"
     filepath = PHOTO_DIR / filename
 
-    result = run_gphoto2(["--capture-image-and-download", f"--filename={filepath}"])
+    result = capture_photo(filepath)
 
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "Capture failed"
+        detail = command_detail(result)
         raise HTTPException(status_code=500, detail=detail)
 
     if not filepath.exists():
-        detail = result.stderr.strip() or result.stdout.strip() or "Capture did not save a file"
+        detail = command_detail(result)
         raise HTTPException(status_code=500, detail=detail)
 
     return {"id": photo_id, "filename": filename, "path": str(filepath)}
@@ -300,7 +429,11 @@ def capture():
 @app.get("/photos")
 def get_photos(request: Request):
     photos = sorted(
-        PHOTO_DIR.glob("*.jpg"),
+        (
+            photo_path
+            for photo_path in PHOTO_DIR.glob("*.jpg")
+            if "-print" not in photo_path.stem
+        ),
         key=lambda photo_path: photo_path.stat().st_mtime,
         reverse=True,
     )
@@ -353,6 +486,10 @@ def make_print(photo_id: str, request: Request):
         "uses_background_removed": uses_background_removed,
     }
 
+@app.post("/photo/{photo_id}/print")
+def print_photo(photo_id: str):
+    return send_print_job(photo_id)
+
 @app.get("/photo/{photo_id}")
 def get_photo(photo_id: str):
     return photo_response(photo_id)
@@ -369,10 +506,6 @@ def get_print(photo_id: str):
 def get_print_preview(photo_id: str):
     return print_preview_response(photo_id)
 
-@app.get("/{photo_id}.jpg")
-def get_photo_by_filename(photo_id: str):
-    return photo_response(photo_id)
-
 @app.get("/{photo_id}-bg-removed.png")
 def get_background_removed_by_filename(photo_id: str):
     return background_removed_response(photo_id)
@@ -384,3 +517,7 @@ def get_print_by_filename(photo_id: str):
 @app.get("/{photo_id}-print.jpg")
 def get_print_preview_by_filename(photo_id: str):
     return print_preview_response(photo_id)
+
+@app.get("/{photo_id}.jpg")
+def get_photo_by_filename(photo_id: str):
+    return photo_response(photo_id)
